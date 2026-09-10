@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, ConfigDict
 
 from promptlab.config import PROJECT_ROOT, Settings
+from promptlab.usage import CallRecord, append_record, compute_cost
 
 DAY1_CASE_IDS = ("E12", "E07", "E11")
 EXTRACTION_CASES_PATH = PROJECT_ROOT / "cases" / "extraction.jsonl"
 BASELINE_PROMPT_PATH = PROJECT_ROOT / "src" / "prompts" / "baseline.v0.md"
+PROMPT_ID = "baseline"
+PROMPT_VERSION = "v0"
 TEMPERATURE = 0.0
 DEFAULT_NUM_PREDICT = 256
 GENERATE_TIMEOUT_SECONDS = 180.0
@@ -98,7 +104,7 @@ def call_mistral(
     num_predict: int = DEFAULT_NUM_PREDICT,
 ) -> GenerateResult:
     model = settings.models["mistral"]
-    # latency_ms is wall-clock time around the HTTP call, not Ollama's (outlined in call record contract)
+    # latency_ms is wall-clock time around the HTTP call, not Ollama's
     # total_duration / eval_duration fields (those are model-side, in nanoseconds).
     started = time.perf_counter()
     response = httpx.post(
@@ -122,20 +128,69 @@ def call_mistral(
     return map_generate_result(payload, latency_ms)
 
 
+def build_successful_record(
+    *,
+    run_id: str,
+    case: ExtractionCase,
+    result: GenerateResult,
+    model_id: str,
+    temperature: float,
+    max_output_tokens: int,
+) -> CallRecord:
+    return CallRecord(
+        record_id=str(uuid4()),
+        run_id=run_id,
+        timestamp=datetime.now(UTC),
+        provider="ollama",
+        model_id=model_id,
+        task="extraction",
+        case_id=case.id,
+        prompt_id=PROMPT_ID,
+        prompt_version=PROMPT_VERSION,
+        attempt=1,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        cached_input_tokens=None,
+        latency_ms=result.latency_ms,
+        cost_usd=compute_cost(model_id, result.input_tokens, result.output_tokens),
+        stop_reason=result.stop_reason,
+        error_type=None,
+        response_text=result.response_text,
+    )
+
+
 def main() -> None:
+    os.chdir(PROJECT_ROOT)
     settings = Settings.from_env()
+    model_id = settings.models["mistral"].model_id
     template = load_baseline_prompt()
     selected = select_day1_cases(load_extraction_cases())
+    run_id = str(uuid4())
+
     for case in selected:
         prompt = render_prompt(template, case.source)
         result = call_mistral(settings, prompt, temperature=TEMPERATURE)
+        record = build_successful_record(
+            run_id=run_id,
+            case=case,
+            result=result,
+            model_id=model_id,
+            temperature=TEMPERATURE,
+            max_output_tokens=DEFAULT_NUM_PREDICT,
+        )
+        append_record(record, run_id)
         print(f"=== {case.id} ===")
-        print(f"input_tokens={result.input_tokens}")
-        print(f"output_tokens={result.output_tokens}")
-        print(f"stop_reason={result.stop_reason}")
-        print(f"latency_ms={result.latency_ms}")
-        print(result.response_text)
+        print(f"record_id={record.record_id}")
+        print(f"input_tokens={record.input_tokens}")
+        print(f"output_tokens={record.output_tokens}")
+        print(f"stop_reason={record.stop_reason}")
+        print(f"latency_ms={record.latency_ms}")
+        print(record.response_text)
         print()
+
+    print(f"appended 3 successful records to runs/{run_id}.jsonl")
 
 
 if __name__ == "__main__":
