@@ -23,6 +23,7 @@ PROMPT_ID = "baseline"
 PROMPT_VERSION = "v0"
 TEMPERATURE = 0.0
 DEFAULT_NUM_PREDICT = 256
+TRUNCATION_NUM_PREDICT = 8
 GENERATE_TIMEOUT_SECONDS = 180.0
 
 
@@ -128,7 +129,7 @@ def call_mistral(
     return map_generate_result(payload, latency_ms)
 
 
-def build_successful_record(
+def build_record(
     *,
     run_id: str,
     case: ExtractionCase,
@@ -136,6 +137,8 @@ def build_successful_record(
     model_id: str,
     temperature: float,
     max_output_tokens: int,
+    attempt: int = 1,
+    error_type: str | None = None,
 ) -> CallRecord:
     return CallRecord(
         record_id=str(uuid4()),
@@ -147,7 +150,7 @@ def build_successful_record(
         case_id=case.id,
         prompt_id=PROMPT_ID,
         prompt_version=PROMPT_VERSION,
-        attempt=1,
+        attempt=attempt,
         temperature=temperature,
         max_output_tokens=max_output_tokens,
         input_tokens=result.input_tokens,
@@ -156,8 +159,38 @@ def build_successful_record(
         latency_ms=result.latency_ms,
         cost_usd=compute_cost(model_id, result.input_tokens, result.output_tokens),
         stop_reason=result.stop_reason,
-        error_type=None,
+        error_type=error_type,
         response_text=result.response_text,
+    )
+
+
+def run_truncation_demo(
+    settings: Settings,
+    template: str,
+    case: ExtractionCase,
+    model_id: str,
+) -> CallRecord:
+    prompt = render_prompt(template, case.source)
+    result = call_mistral(
+        settings,
+        prompt,
+        temperature=TEMPERATURE,
+        num_predict=TRUNCATION_NUM_PREDICT,
+    )
+    if result.stop_reason != "length":
+        raise RuntimeError(
+            "Truncation demo expected done_reason='length', "
+            f"got {result.stop_reason!r}"
+        )
+    return build_record(
+        run_id=str(uuid4()),
+        case=case,
+        result=result,
+        model_id=model_id,
+        temperature=TEMPERATURE,
+        max_output_tokens=TRUNCATION_NUM_PREDICT,
+        attempt=2,
+        error_type="TruncatedResponseError",
     )
 
 
@@ -168,17 +201,34 @@ def main() -> None:
     template = load_baseline_prompt()
     selected = select_day1_cases(load_extraction_cases())
     run_id = str(uuid4())
+    e11 = next(case for case in selected if case.id == "E11")
+
+    num_predict = TRUNCATION_NUM_PREDICT
+    truncation_record = run_truncation_demo(settings, template, e11, model_id)
+    append_record(truncation_record, truncation_record.run_id)
+    print("=== E11 truncation demo ===")
+    print(f"stop_reason={truncation_record.stop_reason}")
+    print(f"error_type={truncation_record.error_type}")
+    print(f"max_output_tokens={truncation_record.max_output_tokens}")
+    print(truncation_record.response_text)
+    print()
+    num_predict = DEFAULT_NUM_PREDICT
 
     for case in selected:
         prompt = render_prompt(template, case.source)
-        result = call_mistral(settings, prompt, temperature=TEMPERATURE)
-        record = build_successful_record(
+        result = call_mistral(
+            settings,
+            prompt,
+            temperature=TEMPERATURE,
+            num_predict=num_predict,
+        )
+        record = build_record(
             run_id=run_id,
             case=case,
             result=result,
             model_id=model_id,
             temperature=TEMPERATURE,
-            max_output_tokens=DEFAULT_NUM_PREDICT,
+            max_output_tokens=num_predict,
         )
         append_record(record, run_id)
         print(f"=== {case.id} ===")
@@ -191,6 +241,10 @@ def main() -> None:
         print()
 
     print(f"appended 3 successful records to runs/{run_id}.jsonl")
+    print(
+        "recorded truncation demo separately in "
+        f"runs/{truncation_record.run_id}.jsonl"
+    )
 
 
 if __name__ == "__main__":
