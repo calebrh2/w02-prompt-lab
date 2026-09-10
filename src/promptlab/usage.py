@@ -6,9 +6,13 @@ Implement this module by following assignments/W02_Day1_Assignment_LOCAL.md.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
+
+from promptlab.config import Settings
+from promptlab.errors import UnknownModelError
 
 
 class CallRecord(BaseModel):
@@ -47,9 +51,17 @@ class CallRecord(BaseModel):
 
 def compute_cost(model_id: str, input_tokens: int, output_tokens: int) -> float:
     """Return the configured provider charge for one model call."""
-    raise NotImplementedError
+    settings = Settings.from_env()
+    for model in settings.models.values():
+        if model.model_id == model_id:
+            return float(model.cost(input_tokens, output_tokens))
+    raise UnknownModelError(model_id)
 
 
 def append_record(record: CallRecord, run_id: str) -> None:
     """Append one JSON record to runs/{run_id}.jsonl without rewriting the file."""
-    raise NotImplementedError
+    path = Path("runs") / f"{run_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(record.model_dump_json() + "\n")
+ 
