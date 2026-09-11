@@ -20,9 +20,9 @@ Evidence: `docs/day2-run.jsonl` (24 records, one `run_id`, 12 summarization case
 
 | Model | Median | Max | Min |
 | --- | ---: | ---: | ---: |
-| Mistral | 3,915.5 | 8,886 | 3,000 |
-| Qwen | 19,312 | 33,408 | 17,108 |
+| Mistral | 3,951 | 7,429 | 3,026 |
+| Qwen | 18,580.5 | 33,326 | 16,287 |
 
 ## Observation
 
-The same requests completed on both models, but they did not spend the budget the same way. Qwen emitted about 4.4× as many output tokens as Mistral (5,015 vs 1,142) and its median latency was about 5× higher (19,312 ms vs 3,915.5 ms). That matches Qwen3 using thinking tokens inside the shared 1,024-token ceiling: input size was actually slightly lower for Qwen (2,427 vs 2,787), so the extra time and tokens are generation-side, not prompt-side. A 256-token ceiling would have been a poor comparison here; at 1,024 both models stopped on their own rather than at the cap.
+The same requests completed on both models, but they did not spend the budget the same way. Qwen emitted about 4.4× as many output tokens as Mistral (5,015 vs 1,142) and its median latency was about 4.7× higher (18,580.5 ms vs 3,951 ms). That matches Qwen3 using thinking tokens inside the shared 1,024-token ceiling: input size was actually slightly lower for Qwen (2,427 vs 2,787), so the extra time and tokens are generation-side, not prompt-side. A 256-token ceiling would have been a poor comparison here; at 1,024 both models stopped on their own rather than at the cap.
