@@ -1,0 +1,251 @@
+"""Day 1 local Ollama instrumentation script."""
+
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import httpx
+from pydantic import BaseModel, ConfigDict
+
+from promptlab.config import PROJECT_ROOT, Settings
+from promptlab.usage import CallRecord, append_record, compute_cost
+
+DAY1_CASE_IDS = ("E12", "E07", "E11")
+EXTRACTION_CASES_PATH = PROJECT_ROOT / "cases" / "extraction.jsonl"
+BASELINE_PROMPT_PATH = PROJECT_ROOT / "src" / "prompts" / "baseline.v0.md"
+PROMPT_ID = "baseline"
+PROMPT_VERSION = "v0"
+TEMPERATURE = 0.0
+DEFAULT_NUM_PREDICT = 256
+TRUNCATION_NUM_PREDICT = 8
+GENERATE_TIMEOUT_SECONDS = 180.0
+
+
+class ExtractionCase(BaseModel):
+    """One extraction corpus case."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    task: str
+    source: str
+
+
+@dataclass(frozen=True)
+class GenerateResult:
+    """One Ollama generate call, mapped onto CallRecord field names."""
+
+    payload: dict[str, Any]
+    latency_ms: int
+    input_tokens: int
+    output_tokens: int
+    stop_reason: str | None
+    response_text: str | None
+
+
+def load_extraction_cases(path: Path = EXTRACTION_CASES_PATH) -> dict[str, ExtractionCase]:
+    cases: dict[str, ExtractionCase] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        case = ExtractionCase.model_validate_json(line)
+        cases[case.id] = case
+    return cases
+
+
+def select_day1_cases(
+    cases: dict[str, ExtractionCase],
+    case_ids: tuple[str, ...] = DAY1_CASE_IDS,
+) -> list[ExtractionCase]:
+    missing = [case_id for case_id in case_ids if case_id not in cases]
+    if missing:
+        raise KeyError(f"Missing extraction cases: {', '.join(missing)}")
+    return [cases[case_id] for case_id in case_ids]
+
+
+def load_baseline_prompt(path: Path = BASELINE_PROMPT_PATH) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def render_prompt(template: str, document_text: str) -> str:
+    return template.replace("{document_text}", document_text)
+
+
+def _require_int(payload: dict[str, Any], key: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"Ollama field {key!r} must be an int, got {value!r}")
+    return value
+
+
+def map_generate_result(payload: dict[str, Any], latency_ms: int) -> GenerateResult:
+    done_reason = payload.get("done_reason")
+    response_text = payload.get("response")
+    return GenerateResult(
+        payload=payload,
+        latency_ms=latency_ms,
+        input_tokens=_require_int(payload, "prompt_eval_count"),
+        output_tokens=_require_int(payload, "eval_count"),
+        stop_reason=done_reason if isinstance(done_reason, str) else None,
+        response_text=response_text if isinstance(response_text, str) else None,
+    )
+
+
+def call_mistral(
+    settings: Settings,
+    prompt: str,
+    *,
+    temperature: float = TEMPERATURE,
+    num_predict: int = DEFAULT_NUM_PREDICT,
+) -> GenerateResult:
+    model = settings.models["mistral"]
+    # latency_ms is wall-clock time around the HTTP call, not Ollama's
+    # total_duration / eval_duration fields (those are model-side, in nanoseconds).
+    started = time.perf_counter()
+    response = httpx.post(
+        f"{settings.ollama_base_url}/api/generate",
+        json={
+            "model": model.model_id,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": num_predict,
+            },
+        },
+        timeout=GENERATE_TIMEOUT_SECONDS,
+    )
+    latency_ms = max(0, round((time.perf_counter() - started) * 1000))
+    response.raise_for_status()
+    payload: object = response.json()
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected JSON object from Ollama, got {type(payload).__name__}")
+    return map_generate_result(payload, latency_ms)
+
+
+def build_record(
+    *,
+    run_id: str,
+    case: ExtractionCase,
+    result: GenerateResult,
+    model_id: str,
+    temperature: float,
+    max_output_tokens: int,
+    attempt: int = 1,
+    error_type: str | None = None,
+) -> CallRecord:
+    return CallRecord(
+        record_id=str(uuid4()),
+        run_id=run_id,
+        timestamp=datetime.now(UTC),
+        provider="ollama",
+        model_id=model_id,
+        task="extraction",
+        case_id=case.id,
+        prompt_id=PROMPT_ID,
+        prompt_version=PROMPT_VERSION,
+        attempt=attempt,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        cached_input_tokens=None,
+        latency_ms=result.latency_ms,
+        cost_usd=compute_cost(model_id, result.input_tokens, result.output_tokens),
+        stop_reason=result.stop_reason,
+        error_type=error_type,
+        response_text=result.response_text,
+    )
+
+
+def run_truncation_demo(
+    settings: Settings,
+    template: str,
+    case: ExtractionCase,
+    model_id: str,
+) -> CallRecord:
+    prompt = render_prompt(template, case.source)
+    result = call_mistral(
+        settings,
+        prompt,
+        temperature=TEMPERATURE,
+        num_predict=TRUNCATION_NUM_PREDICT,
+    )
+    if result.stop_reason != "length":
+        raise RuntimeError(
+            "Truncation demo expected done_reason='length', "
+            f"got {result.stop_reason!r}"
+        )
+    return build_record(
+        run_id=str(uuid4()),
+        case=case,
+        result=result,
+        model_id=model_id,
+        temperature=TEMPERATURE,
+        max_output_tokens=TRUNCATION_NUM_PREDICT,
+        attempt=2,
+        error_type="TruncatedResponseError",
+    )
+
+
+def main() -> None:
+    os.chdir(PROJECT_ROOT)
+    settings = Settings.from_env()
+    model_id = settings.models["mistral"].model_id
+    template = load_baseline_prompt()
+    selected = select_day1_cases(load_extraction_cases())
+    run_id = str(uuid4())
+    e11 = next(case for case in selected if case.id == "E11")
+
+    num_predict = TRUNCATION_NUM_PREDICT
+    truncation_record = run_truncation_demo(settings, template, e11, model_id)
+    append_record(truncation_record, truncation_record.run_id)
+    print("=== E11 truncation demo ===")
+    print(f"stop_reason={truncation_record.stop_reason}")
+    print(f"error_type={truncation_record.error_type}")
+    print(f"max_output_tokens={truncation_record.max_output_tokens}")
+    print(truncation_record.response_text)
+    print()
+    num_predict = DEFAULT_NUM_PREDICT
+
+    for case in selected:
+        prompt = render_prompt(template, case.source)
+        result = call_mistral(
+            settings,
+            prompt,
+            temperature=TEMPERATURE,
+            num_predict=num_predict,
+        )
+        record = build_record(
+            run_id=run_id,
+            case=case,
+            result=result,
+            model_id=model_id,
+            temperature=TEMPERATURE,
+            max_output_tokens=num_predict,
+        )
+        append_record(record, run_id)
+        print(f"=== {case.id} ===")
+        print(f"record_id={record.record_id}")
+        print(f"input_tokens={record.input_tokens}")
+        print(f"output_tokens={record.output_tokens}")
+        print(f"stop_reason={record.stop_reason}")
+        print(f"latency_ms={record.latency_ms}")
+        print(record.response_text)
+        print()
+
+    print(f"appended 3 successful records to runs/{run_id}.jsonl")
+    print(
+        "recorded truncation demo separately in "
+        f"runs/{truncation_record.run_id}.jsonl"
+    )
+
+
+if __name__ == "__main__":
+    main()

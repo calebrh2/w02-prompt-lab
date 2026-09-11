@@ -1,0 +1,2 @@
+## Observations ##
+E12, the shortest case, used 228 input tokens and took 2041 ms round trip. E11, the longest, used 274 input tokens and 4331 ms. Input size was about 20% larger for E11, but latency more than doubled. If you only tracked the latency of processing a short document, you would not reliably be able to tell how expensive a longer one would be, as evidence by my results. 

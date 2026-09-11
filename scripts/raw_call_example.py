@@ -15,6 +15,7 @@ def main() -> None:
     settings = Settings.from_env()
     model = settings.models["mistral"]
 
+    # response text
     response = httpx.post(
         f"{settings.ollama_base_url}/api/generate",
         json={
@@ -32,9 +33,9 @@ def main() -> None:
     payload = response.json()
 
     print("response:", payload.get("response"))
-    print("input tokens:", payload.get("prompt_eval_count"))
-    print("output tokens:", payload.get("eval_count"))
-    print("stop reason:", payload.get("done_reason"))
+    print("input tokens:", payload.get("prompt_eval_count")) # input tokens
+    print("output tokens:", payload.get("eval_count")) # output tokens
+    print("stop reason:", payload.get("done_reason")) # stop reason
 
 
 if __name__ == "__main__":
