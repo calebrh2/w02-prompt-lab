@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+import json
+import types
+from typing import Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -84,4 +86,56 @@ OUTPUT_SCHEMAS: dict[TaskName, type[StrictModel]] = {
     "summarization": SummarizationOutput,
     "extraction": PolicyExtraction,
 }
+
+
+def schema_description(model: type[BaseModel]) -> str:
+    """Return an instance-shaped description generated from a Pydantic model."""
+
+    guide = {
+        name: _describe_annotation(field.annotation) for name, field in model.model_fields.items()
+    }
+    return json.dumps(guide, indent=2)
+
+
+def _describe_annotation(annotation: object) -> object:
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    if origin is Literal:
+        return " | ".join(str(arg) for arg in args)
+
+    if origin is Union or origin is types.UnionType:
+        without_none = [arg for arg in args if arg is not type(None)]
+        has_none = len(without_none) != len(args)
+        described = [_describe_annotation(arg) for arg in without_none]
+        if len(described) == 1:
+            inner = described[0]
+            if has_none:
+                return f"{inner} | null" if isinstance(inner, str) else [inner, None]
+            return inner
+        parts = [item if isinstance(item, str) else json.dumps(item) for item in described]
+        joined = " | ".join(parts)
+        return f"{joined} | null" if has_none else joined
+
+    if origin is list:
+        item = _describe_annotation(args[0]) if args else "any"
+        return [item]
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return {
+            name: _describe_annotation(field.annotation)
+            for name, field in annotation.model_fields.items()
+        }
+
+    if annotation is str:
+        return "string"
+    if annotation is bool:
+        return "boolean"
+    if annotation is int:
+        return "integer"
+    if annotation is float:
+        return "number"
+    if annotation is type(None):
+        return "null"
+    return getattr(annotation, "__name__", str(annotation))
 
